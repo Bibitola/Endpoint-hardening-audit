@@ -28,6 +28,17 @@ function Confirm-Fix {
     return $answer -eq "y"
 }
 
+function Get-RegValue {
+    param ([string]$Path, [string]$Name)
+    try { return (Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop).$Name } catch { return $null }
+}
+
+function Set-RegDword {
+    param ([string]$Path, [string]$Name, [int]$Value)
+    if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
+    New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType DWord -Force | Out-Null
+}
+
 $os = Get-CimInstance Win32_OperatingSystem
 Write-Output "Hardening audit - $($os.Caption) - $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
 if ($Apply) { Write-Output "APPLY MODE: failed controls with safe fixes will prompt individually" }
@@ -69,7 +80,22 @@ if ($mp.RealTimeProtectionEnabled) {
     }
 }
 
-# 4. Guest account
+# 4. Defender signature age
+if ($mp.AntispywareSignatureLastUpdated) {
+    $sigAgeDays = ((Get-Date) - $mp.AntispywareSignatureLastUpdated).TotalDays
+    if ($sigAgeDays -le 7) {
+        Report PASS "Defender signatures" "updated $([math]::Round($sigAgeDays, 1)) days ago"
+    } else {
+        Report FAIL "Defender signatures" "older than 7 days"
+        if (Confirm-Fix "update Defender signatures") {
+            Update-MpSignature
+        }
+    }
+} else {
+    Report FAIL "Defender signatures" "last update time unavailable"
+}
+
+# 5. Guest account
 $guest = Get-LocalUser -Name "Guest" -ErrorAction SilentlyContinue
 if ($guest -and $guest.Enabled) {
     Report FAIL "Guest account" "enabled"
@@ -80,7 +106,7 @@ if ($guest -and $guest.Enabled) {
     Report PASS "Guest account" "disabled or absent"
 }
 
-# 5. Automatic logon
+# 6. Automatic logon
 $winlogon = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" -ErrorAction SilentlyContinue
 if ($winlogon.AutoAdminLogon -eq "1") {
     Report FAIL "Automatic logon" "enabled for '$($winlogon.DefaultUserName)'"
@@ -91,7 +117,7 @@ if ($winlogon.AutoAdminLogon -eq "1") {
     Report PASS "Automatic logon" "disabled"
 }
 
-# 6. Machine inactivity lock
+# 7. Machine inactivity lock
 $inactivity = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name InactivityTimeoutSecs -ErrorAction SilentlyContinue).InactivityTimeoutSecs
 if ($inactivity -and $inactivity -gt 0 -and $inactivity -le 900) {
     Report PASS "Inactivity lock" "${inactivity}s"
@@ -102,7 +128,7 @@ if ($inactivity -and $inactivity -gt 0 -and $inactivity -le 900) {
     }
 }
 
-# 7. SMBv1
+# 8. SMBv1
 $smb1 = (Get-SmbServerConfiguration).EnableSMB1Protocol
 if ($smb1) {
     Report FAIL "SMBv1 protocol" "enabled"
@@ -113,7 +139,7 @@ if ($smb1) {
     Report PASS "SMBv1 protocol" "disabled"
 }
 
-# 8. RDP Network Level Authentication (only matters if RDP is on)
+# 9. RDP Network Level Authentication (only matters if RDP is on)
 $rdpEnabled = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -ErrorAction SilentlyContinue).fDenyTSConnections -eq 0
 if ($rdpEnabled) {
     $nla = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name UserAuthentication -ErrorAction SilentlyContinue).UserAuthentication
@@ -129,7 +155,7 @@ if ($rdpEnabled) {
     Report PASS "RDP" "disabled"
 }
 
-# 9. UAC
+# 10. UAC
 $uac = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name EnableLUA -ErrorAction SilentlyContinue).EnableLUA
 if ($uac -eq 1) {
     Report PASS "User Account Control" "enabled"
@@ -140,12 +166,87 @@ if ($uac -eq 1) {
     }
 }
 
-# 10. USB storage policy (fleet default: blocked)
+# 11. USB storage policy (fleet default: blocked)
 $usbStart = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\USBSTOR" -Name Start -ErrorAction SilentlyContinue).Start
 if ($usbStart -eq 4) {
     Report PASS "USB mass storage" "blocked (fleet default)"
 } else {
     Report FAIL "USB mass storage" "allowed (start type $usbStart) - expected on exempted machines only"
+}
+
+# 12. Windows Update automatic updates
+$auPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"
+$noAutoUpdate = Get-RegValue $auPath "NoAutoUpdate"
+if ($noAutoUpdate -eq 1) {
+    Report FAIL "Windows Update automatic" "disabled by policy"
+    if (Confirm-Fix "enable Windows Update automatic updates") {
+        Set-RegDword $auPath "NoAutoUpdate" 0
+    }
+} else {
+    Report PASS "Windows Update automatic" "not disabled by policy"
+}
+
+# 13. Password minimum length
+$accounts = net accounts | Out-String
+$minLen = [regex]::Match($accounts, "Minimum password length:\s+(\d+)").Groups[1].Value
+if ($minLen -and [int]$minLen -ge 14) {
+    Report PASS "Password minimum length" "$minLen characters"
+} else {
+    Report FAIL "Password minimum length" "$minLen characters - expected 14+ (report only)"
+}
+
+# 14. Account lockout threshold
+$lockout = [regex]::Match($accounts, "Lockout threshold:\s+(Never|\d+)").Groups[1].Value
+if ($lockout -and $lockout -ne "Never" -and [int]$lockout -le 10) {
+    Report PASS "Account lockout threshold" "$lockout invalid attempts"
+} else {
+    Report FAIL "Account lockout threshold" "$lockout - expected 1-10 (report only)"
+}
+
+# 15. PowerShell Script Block Logging
+$psLogPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging"
+$scriptBlock = Get-RegValue $psLogPath "EnableScriptBlockLogging"
+if ($scriptBlock -eq 1) {
+    Report PASS "PowerShell script logging" "enabled"
+} else {
+    Report FAIL "PowerShell script logging" "disabled or not configured"
+    if (Confirm-Fix "enable PowerShell Script Block Logging") {
+        Set-RegDword $psLogPath "EnableScriptBlockLogging" 1
+    }
+}
+
+# 16. LLMNR
+$dnsClientPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient"
+$llmnr = Get-RegValue $dnsClientPath "EnableMulticast"
+if ($llmnr -eq 0) {
+    Report PASS "LLMNR" "disabled"
+} else {
+    Report FAIL "LLMNR" "enabled or not configured"
+    if (Confirm-Fix "disable LLMNR") {
+        Set-RegDword $dnsClientPath "EnableMulticast" 0
+    }
+}
+
+# 17. Secure Boot
+try {
+    if (Confirm-SecureBootUEFI -ErrorAction Stop) {
+        Report PASS "Secure Boot" "enabled"
+    } else {
+        Report FAIL "Secure Boot" "disabled (report only)"
+    }
+} catch {
+    Report FAIL "Secure Boot" "unsupported or unavailable (report only)"
+}
+
+# 18. Event Log service
+$eventLog = Get-Service -Name EventLog -ErrorAction SilentlyContinue
+if ($eventLog -and $eventLog.Status -eq "Running") {
+    Report PASS "Event Log service" "running"
+} else {
+    Report FAIL "Event Log service" "not running"
+    if (Confirm-Fix "start Windows Event Log service") {
+        Start-Service -Name EventLog
+    }
 }
 
 Write-Output ""
